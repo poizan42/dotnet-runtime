@@ -361,7 +361,7 @@ namespace System.IO
                 // Read is invoked asynchronously.  But we can do so using the base Stream's internal helper
                 // that bypasses delegating to BeginRead, since we already know this is FileStream rather
                 // than something derived from it and what our BeginRead implementation is going to do.
-                return (Task<int>)base.BeginReadInternal(buffer, offset, count, null, null, serializeAsynchronously: true, apm: false);
+                return (Task<int>)base.BeginReadInternal(buffer, offset, count, cancellationToken, null, null, serializeAsynchronously: true, apm: false);
             }
 
             return ReadAsyncTask(buffer, offset, count, cancellationToken);
@@ -393,7 +393,7 @@ namespace System.IO
                 // internal helper that bypasses delegating to BeginRead, since we already know this is FileStream
                 // rather than something derived from it and what our BeginRead implementation is going to do.
                 return MemoryMarshal.TryGetArray(buffer, out ArraySegment<byte> segment) ?
-                    new ValueTask<int>((Task<int>)base.BeginReadInternal(segment.Array!, segment.Offset, segment.Count, null, null, serializeAsynchronously: true, apm: false)) :
+                    new ValueTask<int>((Task<int>)base.BeginReadInternal(segment.Array!, segment.Offset, segment.Count, cancellationToken, null, null, serializeAsynchronously: true, apm: false)) :
                     base.ReadAsync(buffer, cancellationToken);
             }
 

@@ -342,11 +342,12 @@ namespace System.IO
 
         public virtual IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback callback, object? state)
         {
-            return BeginReadInternal(buffer, offset, count, callback, state, serializeAsynchronously: false, apm: true);
+            return BeginReadInternal(buffer, offset, count, CancellationToken.None, callback, state, serializeAsynchronously: false, apm: true);
         }
 
         internal IAsyncResult BeginReadInternal(
-            byte[] buffer, int offset, int count, AsyncCallback? callback, object? state,
+            byte[] buffer, int offset, int count, CancellationToken cancellationToken,
+            AsyncCallback? callback, object? state,
             bool serializeAsynchronously, bool apm)
         {
             if (!CanRead) throw Error.GetReadNotSupported();
@@ -360,11 +361,11 @@ namespace System.IO
             Task? semaphoreTask = null;
             if (serializeAsynchronously)
             {
-                semaphoreTask = semaphore.WaitAsync();
+                semaphoreTask = semaphore.WaitAsync(cancellationToken);
             }
             else
             {
-                semaphore.Wait();
+                semaphore.Wait(cancellationToken);
             }
 
             // Create the task to asynchronously do a Read.  This task serves both
@@ -378,13 +379,26 @@ namespace System.IO
                 Debug.Assert(thisTask != null && thisTask._stream != null && thisTask._buffer != null,
                     "Inside ReadWriteTask, InternalCurrent should be the ReadWriteTask, and stream and buffer should be set");
 
+                CancellationToken ct = thisTask.CancellationToken;
+                CancellationTokenRegistration ctReg = default; // The default initialized CTR does nothing when disposed (_node is null)
                 try
                 {
+                    thisTask._osThreadId = Thread.CurrentOSThreadId; // ASSUMPTION: The store cannot be reordered to after UnsafeRegister takes effect
+                    ctReg = ct.UnsafeRegister(onCancelReadWriteDelegate, thisTask);
                     // Do the Read and return the number of bytes read
                     return thisTask._stream.Read(thisTask._buffer, thisTask._offset, thisTask._count);
                 }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw; // Not reached
+                }
                 finally
                 {
+                    thisTask._osThreadId = 0;
+                    // CancellationTokenRegistration.Dispose will wait for the cancellation callback if it is currently running.
+                    // So after this line we should be guarenteed that CancelSynchronousIo won't be called on this thread in an unrelated operation.
+                    ctReg.Dispose();
                     // If this implementation is part of Begin/EndXx, then the EndXx method will handle
                     // finishing the async operation.  However, if this is part of XxAsync, then there won't
                     // be an end method, and this task is responsible for cleaning up.
@@ -395,17 +409,47 @@ namespace System.IO
 
                     thisTask.ClearBeginState(); // just to help alleviate some memory pressure
                 }
-            }, state, this, buffer, offset, count, callback);
+            }, state, this, buffer, offset, count, cancellationToken, callback);
 
             // Schedule it
             if (semaphoreTask != null)
-                RunReadWriteTaskWhenReady(semaphoreTask, asyncResult);
+                RunReadWriteTaskWhenReady(semaphoreTask, asyncResult, cancellationToken);
             else
                 RunReadWriteTask(asyncResult);
 
 
             return asyncResult; // return it
         }
+
+
+        internal static Action<object?> onCancelReadWriteDelegate = OnCancelReadWrite;
+
+        private static void OnCancelReadWrite(object? obj)
+        {
+            const int THREAD_TERMINATE = 0x0001;
+            var thisTask = obj as ReadWriteTask;
+            Debug.Assert(thisTask != null, "Inside OnCancelReadWrite, obj should be ReadWriteTask");
+            SpinWait spinWait = default;
+            int threadId = (int)thisTask._osThreadId;
+            if (threadId == 0)
+                return;
+            IntPtr hThread = Interop.Kernel32.OpenThread_IntPtr(THREAD_TERMINATE, false, threadId);
+            Debug.Assert(hThread != IntPtr.Zero, "Failed opening thread", "OnCancelReadWrite failed opening thread id {0}: {1}", threadId, Marshal.GetLastWin32Error());
+            try
+            {
+                // We may hit a race between _osThreadId being set and the syscall starting, so repeat cancelling until the stream operation has returned.
+                while (thisTask._osThreadId != 0)
+                {
+                    Interop.Kernel32.CancelSynchronousIo(hThread);
+                    spinWait.SpinOnce();
+                }
+            }
+            finally
+            {
+                Interop.Kernel32.CloseHandle(hThread);
+            }
+        }
+
 
         public virtual int EndRead(IAsyncResult asyncResult)
         {
@@ -448,7 +492,7 @@ namespace System.IO
             // Otherwise, return a task that represents the Begin/End methods.
             return cancellationToken.IsCancellationRequested
                         ? Task.FromCanceled<int>(cancellationToken)
-                        : BeginEndReadAsync(buffer, offset, count);
+                        : BeginEndReadAsync(buffer, offset, count, cancellationToken);
         }
 
         public virtual ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
@@ -478,13 +522,13 @@ namespace System.IO
             }
         }
 
-        private Task<int> BeginEndReadAsync(byte[] buffer, int offset, int count)
+        private Task<int> BeginEndReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
             if (!HasOverriddenBeginEndRead())
             {
                 // If the Stream does not override Begin/EndRead, then we can take an optimized path
                 // that skips an extra layer of tasks / IAsyncResults.
-                return (Task<int>)BeginReadInternal(buffer, offset, count, null, null, serializeAsynchronously: true, apm: false);
+                return (Task<int>)BeginReadInternal(buffer, offset, count, cancellationToken, null, null, serializeAsynchronously: true, apm: false);
             }
 
             // Otherwise, we need to wrap calls to Begin/EndWrite to ensure we use the derived type's functionality.
@@ -559,18 +603,18 @@ namespace System.IO
 
                     thisTask.ClearBeginState(); // just to help alleviate some memory pressure
                 }
-            }, state, this, buffer, offset, count, callback);
+            }, state, this, buffer, offset, count, CancellationToken.None, callback);
 
             // Schedule it
             if (semaphoreTask != null)
-                RunReadWriteTaskWhenReady(semaphoreTask, asyncResult);
+                RunReadWriteTaskWhenReady(semaphoreTask, asyncResult, CancellationToken.None);
             else
                 RunReadWriteTask(asyncResult);
 
             return asyncResult; // return it
         }
 
-        private void RunReadWriteTaskWhenReady(Task asyncWaiter, ReadWriteTask readWriteTask)
+        private void RunReadWriteTaskWhenReady(Task asyncWaiter, ReadWriteTask readWriteTask, CancellationToken cancellationToken)
         {
             Debug.Assert(readWriteTask != null);
             Debug.Assert(asyncWaiter != null);
@@ -585,11 +629,12 @@ namespace System.IO
             {
                 asyncWaiter.ContinueWith((t, state) =>
                 {
-                    Debug.Assert(t.IsCompletedSuccessfully, "The semaphore wait should always complete successfully.");
+                    Debug.Assert(!t.IsFaulted, "The semaphore wait should always complete successfully unless it has been cancelled.");
+                    cancellationToken.ThrowIfCancellationRequested();
                     var rwt = (ReadWriteTask)state!;
                     Debug.Assert(rwt._stream != null);
                     rwt._stream.RunReadWriteTask(rwt); // RunReadWriteTask(readWriteTask);
-                }, readWriteTask, default, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }, readWriteTask, cancellationToken, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
         }
 
@@ -668,6 +713,7 @@ namespace System.IO
             internal byte[]? _buffer;
             internal readonly int _offset;
             internal readonly int _count;
+            internal ulong _osThreadId;
             private AsyncCallback? _callback;
             private ExecutionContext? _context;
 
@@ -681,8 +727,9 @@ namespace System.IO
                 bool isRead,
                 bool apm,
                 Func<object?, int> function, object? state,
-                Stream stream, byte[] buffer, int offset, int count, AsyncCallback? callback) :
-                base(function, state, CancellationToken.None, TaskCreationOptions.DenyChildAttach)
+                Stream stream, byte[] buffer, int offset, int count,
+                CancellationToken cancellationToken, AsyncCallback? callback) :
+                base(function, state, cancellationToken, TaskCreationOptions.DenyChildAttach)
             {
                 Debug.Assert(function != null);
                 Debug.Assert(stream != null);
@@ -1321,7 +1368,7 @@ namespace System.IO
                     // _stream due to this call blocked while holding the lock.
                     return overridesBeginRead ?
                         _stream.BeginRead(buffer, offset, count, callback, state) :
-                        _stream.BeginReadInternal(buffer, offset, count, callback, state, serializeAsynchronously: true, apm: true);
+                        _stream.BeginReadInternal(buffer, offset, count, CancellationToken.None, callback, state, serializeAsynchronously: true, apm: true);
                 }
 #endif
             }
