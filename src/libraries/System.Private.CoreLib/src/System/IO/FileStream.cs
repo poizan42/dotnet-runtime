@@ -116,6 +116,9 @@ namespace System.IO
             // As the handle was passed in, we must set the handle field at the very end to
             // avoid the finalizer closing the handle when we throw errors.
             _fileHandle = safeHandle;
+#if PLATFORM_WINDOWS
+            SupportsCancelSynchronousIo = true;
+#endif
         }
 
         public FileStream(SafeFileHandle handle, FileAccess access)
