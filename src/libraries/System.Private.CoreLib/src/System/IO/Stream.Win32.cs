@@ -10,6 +10,7 @@ namespace System.IO
         protected internal bool SupportsCancelSynchronousIo { get; set; }
         private static readonly Action<object?> _onCancelReadWriteDelegate = OnCancelReadWrite;
         private static readonly Func<object?, int> _syncIOCancelableReadWriteTaskReadDelegate = SyncIOCancelableReadWriteTaskRead;
+        private static readonly Func<object?, int> _syncIOCancelableReadWriteTaskWriteDelegate = SyncIOCancelableReadWriteTaskWrite;
 
         private static int SyncIOCancelableReadWriteTaskRead(object? _)
         {
@@ -28,6 +29,49 @@ namespace System.IO
                 ctReg = ct.UnsafeRegister(_onCancelReadWriteDelegate, thisTask);
                 // Do the Read and return the number of bytes read
                 return thisTask._stream.Read(thisTask._buffer, thisTask._offset, thisTask._count);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                ct.ThrowIfCancellationRequested();
+                throw; // Not reached
+            }
+            finally
+            {
+                thisTask._osThreadId = 0;
+                // CancellationTokenRegistration.Dispose will wait for the cancellation callback if it is currently running.
+                // So after this line we should be guarenteed that it is either done calling CancelSynchronousIo or _cancelTask has been spun up.
+                ctReg.Dispose();
+                thisTask._cancelTask?.Wait();
+                // If this implementation is part of Begin/EndXx, then the EndXx method will handle
+                // finishing the async operation.  However, if this is part of XxAsync, then there won't
+                // be an end method, and this task is responsible for cleaning up.
+                if (!thisTask._apm)
+                {
+                    thisTask._stream.FinishTrackingAsyncOperation();
+                }
+
+                thisTask.ClearBeginState(); // just to help alleviate some memory pressure
+            }
+        }
+
+        private static int SyncIOCancelableReadWriteTaskWrite(object? _)
+        {
+            // The ReadWriteTask stores all of the parameters to pass to Write.
+            // As we're currently inside of it, we can get the current task
+            // and grab the parameters from it.
+            var thisTask = Task.InternalCurrent as ReadWriteTask;
+            Debug.Assert(thisTask != null && thisTask._stream != null && thisTask._buffer != null,
+                "Inside ReadWriteTask, InternalCurrent should be the ReadWriteTask, and stream and buffer should be set");
+
+            CancellationToken ct = thisTask.CancellationToken;
+            CancellationTokenRegistration ctReg = default; // The default initialized CTR does nothing when disposed (_node is null)
+            try
+            {
+                thisTask._osThreadId = Thread.CurrentOSThreadId;
+                ctReg = ct.UnsafeRegister(_onCancelReadWriteDelegate, thisTask);
+                // Do the Write
+                thisTask._stream.Write(thisTask._buffer, thisTask._offset, thisTask._count);
+                return 0; // not used, but signature requires a value be returned
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {

@@ -491,7 +491,7 @@ namespace System.IO
                 // Write is invoked asynchronously.  But we can do so using the base Stream's internal helper
                 // that bypasses delegating to BeginWrite, since we already know this is FileStream rather
                 // than something derived from it and what our BeginWrite implementation is going to do.
-                return (Task)base.BeginWriteInternal(buffer, offset, count, null, null, serializeAsynchronously: true, apm: false);
+                return (Task)base.BeginWriteInternal(buffer, offset, count, cancellationToken, null, null, serializeAsynchronously: true, apm: false);
             }
 
             return WriteAsyncInternal(new ReadOnlyMemory<byte>(buffer, offset, count), cancellationToken).AsTask();
@@ -523,7 +523,7 @@ namespace System.IO
                 // internal helper that bypasses delegating to BeginWrite, since we already know this is FileStream
                 // rather than something derived from it and what our BeginWrite implementation is going to do.
                 return MemoryMarshal.TryGetArray(buffer, out ArraySegment<byte> segment) ?
-                    new ValueTask((Task)BeginWriteInternal(segment.Array!, segment.Offset, segment.Count, null, null, serializeAsynchronously: true, apm: false)) :
+                    new ValueTask((Task)BeginWriteInternal(segment.Array!, segment.Offset, segment.Count, cancellationToken, null, null, serializeAsynchronously: true, apm: false)) :
                     base.WriteAsync(buffer, cancellationToken);
             }
 
