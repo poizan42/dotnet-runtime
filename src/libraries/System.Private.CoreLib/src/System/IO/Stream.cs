@@ -388,9 +388,9 @@ namespace System.IO
                     // Do the Read and return the number of bytes read
                     return thisTask._stream.Read(thisTask._buffer, thisTask._offset, thisTask._count);
                 }
-                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
+                    ct.ThrowIfCancellationRequested();
                     throw; // Not reached
                 }
                 finally
@@ -399,8 +399,7 @@ namespace System.IO
                     // CancellationTokenRegistration.Dispose will wait for the cancellation callback if it is currently running.
                     // So after this line we should be guarenteed that it is either done calling CancelSynchronousIo or _cancelTask has been spun up.
                     ctReg.Dispose();
-                    if (thisTask._cancelTask != null)
-                        thisTask._cancelTask.Wait();
+                    thisTask._cancelTask?.Wait();
                     // If this implementation is part of Begin/EndXx, then the EndXx method will handle
                     // finishing the async operation.  However, if this is part of XxAsync, then there won't
                     // be an end method, and this task is responsible for cleaning up.
@@ -424,7 +423,7 @@ namespace System.IO
         }
 
 
-        internal static Action<object?> onCancelReadWriteDelegate = OnCancelReadWrite;
+        internal static readonly Action<object?> onCancelReadWriteDelegate = OnCancelReadWrite;
 
         private static void OnCancelReadWrite(object? obj)
         {
@@ -674,9 +673,9 @@ namespace System.IO
                 asyncWaiter.ContinueWith((t, state) =>
                 {
                     Debug.Assert(!t.IsFaulted, "The semaphore wait should always complete successfully unless it has been cancelled.");
-                    cancellationToken.ThrowIfCancellationRequested();
                     var rwt = (ReadWriteTask)state!;
                     Debug.Assert(rwt._stream != null);
+                    rwt.CancellationToken.ThrowIfCancellationRequested();
                     rwt._stream.RunReadWriteTask(rwt); // RunReadWriteTask(readWriteTask);
                 }, readWriteTask, cancellationToken, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
             }
